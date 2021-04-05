@@ -1,0 +1,402 @@
+﻿#pragma enable_d3d11_debug_symbols 
+
+#pragma kernel PathTrace_uniform_grid
+ #pragma enable_d3d11_debug_symbols 
+#include "Utils.cginc"
+
+RWTexture2D<float4> output;
+
+struct PTMaterial
+{
+    float3 color;
+    float metallic;
+	float smoothness;
+	int isLight;
+};
+//scene data
+StructuredBuffer<float4x4> triangle_list;
+StructuredBuffer<uint2> grid_data;
+StructuredBuffer<uint> index_list;
+StructuredBuffer<int> MatIdxBuffer;
+StructuredBuffer<PTMaterial> MatBuffer;
+
+int num_tris;
+
+float3 grid_min;
+float3 grid_max;
+
+float4 grid_origin;
+float4 grid_size;
+uint num_cells_x;
+uint num_cells_y;
+uint num_cells_z;
+
+//camera data
+float4x4 worldspace_frustum_corners;
+float4 screen_size;
+float4 camera_position;
+
+int start_seed;
+
+struct CS_INPUT
+{
+	uint3 Gid : SV_GroupID;
+	uint3 GTid : SV_GroupThreadID;
+	uint3 DTid : SV_DispatchThreadID;
+	uint GI : SV_GroupIndex;
+};
+
+
+bool SceneIntersection(Ray ray, out float3 position, out float3 normal, out uint triIdx)
+{
+	//3D DDA
+	triIdx = 0;
+
+	bool ris = false;
+	float3 p;
+
+	//TODO: try to remove the following branch
+
+	//check if ray origin is inside the voxel grid
+	if (point_inside_box(ray.origin, grid_min, grid_max))
+	{
+		p = ray.origin;
+	}
+	else  //the origin is not in the grid, check if the ray intersects the grid
+	{
+		float tmin, tmax;
+		float3 aabb[2] = { grid_min, grid_max };
+
+		ray_box_intersection(ray, aabb, tmin, tmax);
+
+		if (tmin > tmax)  //no scene intersection
+		{
+			return false;
+		}
+		else
+		{
+			p = ray.origin + tmin * ray.direction;
+		}
+	}
+
+	float3 local_grid_p = (p - grid_origin) * grid_size;
+	local_grid_p = min(local_grid_p, float3(num_cells_x, num_cells_y, num_cells_z) - 0.001);
+	local_grid_p = max(local_grid_p, float3(0, 0, 0) + 0.001);
+
+	int3 voxel = (int3)(floor(local_grid_p) + 0.001);
+	uint flat_index = voxel.x + voxel.y * num_cells_x + voxel.z * num_cells_x * num_cells_y;
+
+	//now find tmax and delta
+	int3 step_dir = int3(ray.direction.x > 0 ? 1 : -1, ray.direction.y > 0 ? 1 : -1, ray.direction.z > 0 ? 1 : -1);
+	float3 inv_dir = 1.0 / ray.direction;
+	float3 cell_size = 1.0 / grid_size;
+	float3 tmp = frac(local_grid_p) + (1 - 2 * frac(local_grid_p)) * (step_dir + 1) * 0.5;
+	float3 tMax = tmp * abs(inv_dir) * cell_size;
+	float3 delta = abs(inv_dir) * cell_size;
+
+	bool intersected = false;
+
+	float t = 0;
+	float3 b;  //b are the barycentric coordinates of the intersection, i use them to compute the weighted normal
+
+	//voxel marching
+	//TODO: implement optimizations from Kai Xiao 2012
+	while (voxel.x < num_cells_x && voxel.x >= 0 && voxel.y < num_cells_y && voxel.y >= 0 && voxel.z < num_cells_z && voxel.z >= 0)
+	{
+		flat_index = voxel.x + voxel.y * num_cells_x + voxel.z * num_cells_x * num_cells_y;
+
+		uint start_offset = grid_data[flat_index].x;
+		uint num_tris = grid_data[flat_index].y;
+
+		float min_t = 999999;
+		float3 min_b;
+		float min_tris_index;
+
+		//search for triangle intersection
+		for (int j = start_offset; j < start_offset + num_tris; ++j)
+		{
+			uint tris_index = index_list[j];
+			float4x4 tri = triangle_list[tris_index];
+
+			if (ray_triangle_intersection(ray, tri, t, b))
+			{
+				//check if the intersection is inside the current voxel
+				float3 tmp_position = ray.origin + t * ray.direction;
+				float3 tmp_local_p = (tmp_position - grid_origin) * grid_size;
+				int3 intersection_voxel = (int3)(floor(tmp_local_p));
+				if (intersection_voxel.x == voxel.x && intersection_voxel.y == voxel.y && intersection_voxel.z == voxel.z)
+				{
+					if (t < min_t)
+					{
+						min_t = t;
+						min_b = b;
+						min_tris_index = tris_index;
+					}
+
+					intersected = true;
+				}
+			}
+		}
+
+		if (intersected)
+		{
+			position = ray.origin + min_t * ray.direction;
+
+			float4x4 tri = triangle_list[min_tris_index];
+			normal = GetNormal(tri, min_b);
+
+			triIdx = min_tris_index;
+			ris = true;
+			break;
+		}
+		
+		//go to the next voxel on the ray
+		if (tMax.x < tMax.y)
+		{
+			if (tMax.x < tMax.z)
+			{
+				tMax.x += delta.x;
+				voxel.x += step_dir.x;
+			}
+			else
+			{
+				tMax.z += delta.z;
+				voxel.z += step_dir.z;
+			}
+		}
+		else
+		{
+			if (tMax.y < tMax.z)
+			{
+				tMax.y += delta.y;
+				voxel.y += step_dir.y;
+			}
+			else
+			{
+				tMax.z += delta.z;
+				voxel.z += step_dir.z;
+			}
+		}
+	}
+
+	return ris;
+}
+
+static const int NUM_BOUNCES = 3;
+
+float DistributionGGX(float3 N, float3 H, float roughness)
+{
+    float a      = roughness*roughness;
+    float a2     = a*a;
+    float NdotH  = saturate(dot(N, H));
+    float NdotH2 = NdotH*NdotH;
+
+    float nom   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r*r) / 8.0;
+	
+	float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+float GeometrySmith(float3 N, float3 V, float3 L, float roughness)
+{
+    float NdotV = saturate(dot(N, V));
+    float NdotL = saturate(dot(N, L));
+    float ggx2  = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1  = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+
+float3 fresnelSchlick(float cosTheta, float3 F0)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}  
+
+float SmoothnessToPerceptualRoughness(float smoothness)
+{
+    return (1 - smoothness);
+}
+
+
+float3 BRDF(PTMaterial mat,float3 N, float3 vo, float3 vi, out float pdf)
+{
+	float3 F0 = float3(0.04, 0.04, 0.04);
+    F0 = lerp(F0, mat.color, mat.metallic);
+	
+    float3 H = normalize(vo + vi); 
+	
+    float3 F = fresnelSchlick(saturate(dot(H, vo)), F0);  
+	
+    float3 kS = F;
+	float3 kD = float3(1.0, 1.0, 1.0) - kS;
+	kD *= 1.0 - mat.metallic;     
+
+	float roughness = SmoothnessToPerceptualRoughness(mat.smoothness);
+	float NDF = DistributionGGX(N, H, roughness);         
+    float G   = GeometrySmith(N, vo, vi, roughness);      
+
+    float3 nominator    = NDF * F * G;
+    float denominator = 4.0 * saturate(dot(N, vo)) * saturate(dot(N, vi)) + 0.001; 
+    float3 specular1     = nominator / denominator;
+        
+    float3 result = (kD * mat.color / PI + specular1);
+
+	float pdfSpec = NDF *  saturate(dot(N, H)) / (4.f*abs(saturate(dot(vo, H))) + 0.0001);
+	float pdfDiffuse = saturate(dot(N, vi)) / PI;// 这里采用cosineWeight， why   1 / 2 *PI;//
+	pdf = lerp(pdfDiffuse ,pdfSpec, kS );
+	return result;
+}
+
+float GetRandom(inout float seed)
+{				
+	seed = rand_xorshift(seed);
+	float u = seed * (1.0 / 4294967296.0);
+	return u;
+}
+
+[numthreads(8, 8, 1)]
+void PathTrace_uniform_grid(CS_INPUT input)
+{
+	if (input.DTid.x < screen_size.x && input.DTid.y < screen_size.y)
+	{
+		//compute view ray
+		float2 uv = float2(input.DTid.xy) / (screen_size.xy - 1);
+		float3 eye_dir = lerp(lerp(worldspace_frustum_corners[0], worldspace_frustum_corners[1], uv.y), lerp(worldspace_frustum_corners[2], worldspace_frustum_corners[3], uv.y), uv.x);
+		eye_dir = normalize(eye_dir);
+
+		Ray ray = MakeRay(camera_position.xyz, eye_dir);
+
+		float3 intersection_position;
+		float3 intersection_normal;
+
+		float weight = 1; // 这是夹角cos(theta)
+		float3 brdf = float3(1.0, 1.0, 1.0); 
+		
+		float3 L = float3(0, 0, 0);
+		float pdf = 1;
+		float3 testResult = float3(1,1,1);
+
+		float3 areaLightCenter = float3(0, 1.95f, 0.0f);
+		float areaLightWidth = 1;
+		float3 areaLightNormal = float3(0, -1, 0);
+		float3 lightColor =  float3(10.0, 10.0, 10.0);
+		float scaleFactor = 1.0f;
+		//random initial seed using thread id
+		uint seed = wang_hash(input.DTid.x + input.DTid.y * screen_size.x + start_seed);
+
+		for (int bounce = 0; bounce < NUM_BOUNCES; ++bounce)
+		{
+			uint triIdx = 0;
+			if (SceneIntersection(ray, intersection_position, intersection_normal, triIdx ))
+			{
+				intersection_normal = normalize(intersection_normal);
+				
+				// 取得材质
+				PTMaterial mat = MatBuffer[MatIdxBuffer[triIdx]]; 
+
+				if (mat.isLight == 1)
+				{
+					if (bounce == 0)
+					{
+						L = lightColor;
+					}
+					break;
+				}
+
+				// 来自光源的直接光照
+				float LightU = GetRandom(seed) - 0.5f;
+				float LightV = GetRandom(seed) - 0.5f;
+
+				float3 posOnLight = areaLightCenter + float3(LightU * areaLightWidth , LightV * areaLightWidth, 0);
+
+				float3 DistFromPToLight = posOnLight - intersection_position;				
+				float3 wiLi = normalize(DistFromPToLight);
+				// 到光源是否有遮挡				
+				Ray rayToLight = MakeRay(intersection_position.xyz, wiLi);
+				
+				float3 rayToLightIntersectPos;
+				float3 rayToLightIntersectN;				
+				uint rayToLightIntersectTriIdx = 0;
+				SceneIntersection(rayToLight, rayToLightIntersectPos, rayToLightIntersectN, rayToLightIntersectTriIdx  );
+				
+				// 取得阻挡材质
+				PTMaterial matOcclude = MatBuffer[MatIdxBuffer[rayToLightIntersectTriIdx]]; 
+				if (matOcclude.isLight == 1)
+				{					
+					float sqDist = dot(DistFromPToLight, DistFromPToLight);
+					float pdfLi = 1;
+					float3 LightBrdf = BRDF(mat, intersection_normal, -ray.direction, wiLi, pdfLi );
+					pdfLi = 1;
+					float cosTheta = saturate(dot(intersection_normal, wiLi));
+					float cosThetaPrime = saturate(dot(areaLightNormal, -wiLi));
+					float3 L_dir = lightColor;
+					
+						L_dir *=  LightBrdf * cosTheta * cosThetaPrime / (sqDist + 0.0001)/ pdfLi;
+
+					L += L_dir * scaleFactor;
+				}
+
+							
+				
+				//generate new ray according to the intersected surface normal
+				float u = GetRandom(seed);
+				float v = GetRandom(seed);
+				// 如果是绝对光滑
+				if (mat.smoothness == 1)
+				{
+				}
+				else
+				{
+				}
+				
+				// 根据分布进行重要性采样
+				float3 wh = GGX_Sample_wh(u, v, intersection_normal, SmoothnessToPerceptualRoughness(mat.smoothness));
+				float3 wi = reflect(ray.direction, wh);
+
+				weight = saturate(dot(intersection_normal, wi));		
+				float pdfLocal = 1;
+				brdf = BRDF(mat, intersection_normal, -ray.direction, wi, pdfLocal );
+						
+				//pdf = pdfLocal;
+				
+				scaleFactor *= (weight * brdf / (pdfLocal+0.0001));
+
+				ray.origin = intersection_position + intersection_normal * 0.01;
+				ray.direction = wi;
+
+				
+			}
+			else
+			{
+			/*
+				L += float3(1.0, 1.0, 1.0) * weight * brdf * pdf;  //float3(1.5, 1.5, 1.5) is the temporary skybox value
+				
+				if (bounce == 0)
+					L = float3(0, 0, 0);
+
+				break;*/
+				break;
+			}
+		}
+
+		float4 ris = output[input.DTid.xy];
+		float num_samples = ris.a;
+		L = 1.0 / (num_samples + 1) * (num_samples * ris.rgb + L);
+		ris = float4(L, num_samples + 1);
+		
+		output[input.DTid.xy] = ris;
+		//output[input.DTid.xy] = float4(testResult,1);
+	}
+}
